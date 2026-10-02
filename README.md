@@ -62,7 +62,28 @@ pip install -r requirements.txt
 
 3. **Run the application**
 ```bash
-streamlit run stock_dashboard.py
+python app.py
+# (serves on http://localhost:8050; equivalent to: streamlit run stock_dashboard.py)
+```
+
+The data layer (`pipeline.py`) is split into:
+
+- **Fetching layer** (`DataFetcher`) - explicit thread-safe LRU cache keyed on
+  `(ticker, start date, end date, adjustment)`; concurrent identical requests
+  are coalesced, and after 3 fetch timeouts the last good snapshot is served
+  with a freshness warning banner at the top of the page.
+- **Indicator layer** (`calculate_technical_indicators`) - rows are sorted by
+  date before any RSI/MACD/rolling calculation; windows that are too short
+  stay empty (`NaN`), never zero.
+- **Labels & backtest** - the forward price label (`shift(-1)`) and backtest
+  returns use the identical direction; warm-up rows are dropped on the
+  feature side, only the final bar (no next price) is dropped on the label
+  side, and the backtest series is strictly `dropna`'d (no look-ahead).
+
+Run the pipeline tests with:
+
+```bash
+python -m pytest -q
 ```
 
 4. **Open your browser**

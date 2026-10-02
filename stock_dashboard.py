@@ -1,4 +1,3 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -12,6 +11,29 @@ from sklearn.model_selection import train_test_split
 import warnings
 warnings.filterwarnings('ignore')
 
+from pipeline import (
+    ADJUST_LABELS,
+    DEFAULT_FEATURE_COLS,
+    DataFetcher,
+    align_features_target,
+    calculate_technical_indicators as compute_indicators,
+    make_label_target,
+    prepare_ml_features as build_ml_features,
+    run_backtest,
+)
+
+# Single fetching layer for the whole app: explicit LRU keyed on
+# (ticker, start, end, adjust), with stale-snapshot fallback.
+# st.cache_resource keeps one instance across Streamlit reruns (the script
+# re-runs top-to-bottom on every interaction), so quotes fetched for one
+# user action are reused by the next instead of being re-requested.
+@st.cache_resource
+def get_data_fetcher():
+    return DataFetcher()
+
+
+data_fetcher = get_data_fetcher()
+
 # Configure Streamlit page
 st.set_page_config(
     page_title="AI Stock Market Dashboard",
@@ -24,193 +46,116 @@ class StockAnalyzer:
     def __init__(self):
         self.scaler = StandardScaler()
         self.model = RandomForestRegressor(n_estimators=100, random_state=42)
-        
-    def fetch_stock_data(self, symbol, period="1y"):
-        """Fetch stock data with error handling"""
-        try:
-            stock = yf.Ticker(symbol)
-            data = stock.history(period=period)
-            info = stock.info
-            return data, info
-        except Exception as e:
-            st.error(f"Error fetching data for {symbol}: {str(e)}")
-            return None, None
-    
+
+    def fetch_stock_data(self, symbol, start, end, adjust="raw"):
+        """Fetch through the layered cache (one network call per triple)."""
+        return data_fetcher.fetch(symbol, start, end, adjust)
+
     def calculate_technical_indicators(self, data):
-        """Calculate comprehensive technical indicators using pure pandas/numpy"""
-        df = data.copy()
-        
-        # Simple Moving Averages
-        df['SMA_20'] = df['Close'].rolling(window=20).mean()
-        df['SMA_50'] = df['Close'].rolling(window=50).mean()
-        df['SMA_200'] = df['Close'].rolling(window=200).mean()
-        
-        # Exponential Moving Averages
-        df['EMA_12'] = df['Close'].ewm(span=12).mean()
-        df['EMA_26'] = df['Close'].ewm(span=26).mean()
-        
-        # MACD
-        df['MACD'] = df['EMA_12'] - df['EMA_26']
-        df['MACD_signal'] = df['MACD'].ewm(span=9).mean()
-        df['MACD_histogram'] = df['MACD'] - df['MACD_signal']
-        
-        # RSI
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
-        
-        # Bollinger Bands
-        df['BB_middle'] = df['Close'].rolling(window=20).mean()
-        bb_std = df['Close'].rolling(window=20).std()
-        df['BB_upper'] = df['BB_middle'] + (bb_std * 2)
-        df['BB_lower'] = df['BB_middle'] - (bb_std * 2)
-        
-        # Volume indicators
-        df['Volume_SMA'] = df['Volume'].rolling(window=20).mean()
-        df['Volume_ratio'] = df['Volume'] / df['Volume_SMA']
-        
-        # Price-based indicators
-        df['High_Low_Pct'] = (df['High'] - df['Low']) / df['Close'] * 100
-        df['Price_Change'] = df['Close'] - df['Open']
-        df['Price_Change_Pct'] = (df['Close'] - df['Open']) / df['Open'] * 100
-        
-        # Volatility (Average True Range approximation)
-        df['High_Low'] = df['High'] - df['Low']
-        df['High_Close'] = np.abs(df['High'] - df['Close'].shift())
-        df['Low_Close'] = np.abs(df['Low'] - df['Close'].shift())
-        df['True_Range'] = df[['High_Low', 'High_Close', 'Low_Close']].max(axis=1)
-        df['ATR'] = df['True_Range'].rolling(window=14).mean()
-        
-        # Stochastic Oscillator
-        low_14 = df['Low'].rolling(window=14).min()
-        high_14 = df['High'].rolling(window=14).max()
-        df['Stoch_K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14))
-        df['Stoch_D'] = df['Stoch_K'].rolling(window=3).mean()
-        
-        return df
-    
+        """Indicator layer: sort by date, NaN until each window is full."""
+        return compute_indicators(data)
+
     def prepare_ml_features(self, data):
-        """Prepare features for machine learning"""
-        df = data.copy()
-        
-        # Returns and momentum
-        df['Returns'] = df['Close'].pct_change()
-        df['Returns_5d'] = df['Close'].pct_change(5)
-        df['Returns_10d'] = df['Close'].pct_change(10)
-        
-        # Lag features
-        for lag in [1, 2, 3, 5, 10]:
-            df[f'Close_lag_{lag}'] = df['Close'].shift(lag)
-            df[f'Volume_lag_{lag}'] = df['Volume'].shift(lag)
-            df[f'Returns_lag_{lag}'] = df['Returns'].shift(lag)
-        
-        # Rolling statistics
-        for window in [5, 10, 20, 50]:
-            df[f'Close_mean_{window}'] = df['Close'].rolling(window).mean()
-            df[f'Close_std_{window}'] = df['Close'].rolling(window).std()
-            df[f'Volume_mean_{window}'] = df['Volume'].rolling(window).mean()
-            df[f'High_mean_{window}'] = df['High'].rolling(window).mean()
-            df[f'Low_mean_{window}'] = df['Low'].rolling(window).mean()
-        
-        # Price position relative to moving averages
-        df['Price_vs_SMA20'] = (df['Close'] - df['SMA_20']) / df['SMA_20'] * 100
-        df['Price_vs_SMA50'] = (df['Close'] - df['SMA_50']) / df['SMA_50'] * 100
-        
-        # Volatility features
-        df['Price_volatility_10d'] = df['Returns'].rolling(10).std()
-        df['Price_volatility_20d'] = df['Returns'].rolling(20).std()
-        
-        return df
+        return build_ml_features(data)
     
     def train_prediction_model(self, data):
-        """Train ML model for price prediction"""
+        """Train on the forward (next-bar) price label.
+
+        Warm-up rows with non-ready features are dropped on the feature
+        side; only the final bar (no next price) is dropped on the label
+        side. No ffill/bfill, so no information leaks across dates.
+        """
         df = self.prepare_ml_features(data)
-        df = df.dropna()
-        
-        if len(df) < 100:  # Need minimum data
-            return None
-        
-        # Features for prediction (excluding target-related columns)
-        exclude_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'Dividends', 'Stock Splits', 
-                       'Returns', 'Returns_5d', 'Returns_10d']
-        feature_cols = [col for col in df.columns if not any(exc in col for exc in exclude_cols)]
-        feature_cols = [col for col in feature_cols if 'lag' in col or 'mean' in col or 
-                       'std' in col or col in ['RSI', 'MACD', 'Price_vs_SMA20', 'Price_vs_SMA50', 
-                                              'Price_volatility_10d', 'Price_volatility_20d', 'ATR']]
-        
+        feature_cols = [c for c in DEFAULT_FEATURE_COLS if c in df.columns]
         if len(feature_cols) < 5:
             return None
-        
-        X = df[feature_cols].fillna(method='ffill').fillna(method='bfill')
-        y = df['Close'].shift(-1)  # Predict next day's close
-        
-        # Remove last row (no target) and any remaining NaN
-        X = X[:-1]
-        y = y[:-1]
-        
-        # Remove any remaining NaN values
-        mask = ~(X.isna().any(axis=1) | y.isna())
-        X = X[mask]
-        y = y[mask]
-        
+
+        target = make_label_target(df['Close'])
+        X, y, _tail_dropped = align_features_target(df[feature_cols], target)
+
         if len(X) < 50:
             return None
-        
-        # Split and train
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
+
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_test_scaled = self.scaler.transform(X_test)
-        
+
         self.model.fit(X_train_scaled, y_train)
-        
-        # Calculate accuracy
+
         train_score = self.model.score(X_train_scaled, y_train)
         test_score = self.model.score(X_test_scaled, y_test)
-        
+
+        last_row = df[feature_cols].dropna().iloc[-1:]
         return {
             'train_score': train_score,
             'test_score': test_score,
             'feature_importance': dict(zip(feature_cols, self.model.feature_importances_)),
-            'last_features': X.iloc[-1:],
-            'feature_cols': feature_cols
+            'last_features': last_row,
+            'feature_cols': feature_cols,
+            'features_frame': df,
         }
     
     def predict_next_price(self, model_info):
         """Predict next trading day price"""
         if model_info is None:
             return None
-        
+
         last_features_scaled = self.scaler.transform(model_info['last_features'])
-        prediction = self.model.predict(last_features_scaled)[0]
-        
-        return prediction
+        return float(self.model.predict(last_features_scaled)[0])
+
+    def run_model_backtest(self, data, model_info):
+        """Backtest model signals with the same forward shift as the label.
+
+        Predicted next-bar price above today's close -> long (1),
+        otherwise flat (0). run_backtest dropna's strictly, so the tail
+        bar with no forward return is excluded.
+        """
+        if model_info is None:
+            return None
+        df = model_info['features_frame']
+        feature_cols = model_info['feature_cols']
+
+        target = make_label_target(df['Close'])
+        X, _y, _tail = align_features_target(df[feature_cols], target)
+        if X.empty:
+            return None
+
+        preds = pd.Series(
+            self.model.predict(self.scaler.transform(X)), index=X.index
+        )
+        current = df['Close'].reindex(X.index)
+        position = pd.Series(np.where(preds > current, 1.0, 0.0), index=X.index)
+        position = position.reindex(df.index)
+        return run_backtest(df['Close'], position)
     
     def generate_market_analysis(self, data, info, symbol):
         """Generate AI-powered market analysis"""
-        latest = data.iloc[-1]
-        prev = data.iloc[-2]
+        valid = data.dropna(subset=['Close'])
+        latest = valid.iloc[-1]
+        prev = valid.iloc[-2]
+        info = info or {}
         
         # Price movement
         price_change = latest['Close'] - prev['Close']
         price_change_pct = (price_change / prev['Close']) * 100
         
-        # Technical analysis
-        rsi = latest.get('RSI', 50)
-        sma_20 = latest.get('SMA_20', latest['Close'])
-        sma_50 = latest.get('SMA_50', latest['Close'])
-        bb_upper = latest.get('BB_upper', latest['Close'])
-        bb_lower = latest.get('BB_lower', latest['Close'])
+        # Technical analysis (NaN-safe: fall back to neutral/price values)
+        rsi = latest['RSI'] if 'RSI' in valid.columns and pd.notna(latest.get('RSI')) else 50
+        sma_20 = latest['SMA_20'] if 'SMA_20' in valid.columns and pd.notna(latest.get('SMA_20')) else latest['Close']
+        sma_50 = latest['SMA_50'] if 'SMA_50' in valid.columns and pd.notna(latest.get('SMA_50')) else latest['Close']
+        bb_upper = latest['BB_upper'] if 'BB_upper' in valid.columns and pd.notna(latest.get('BB_upper')) else latest['Close']
+        bb_lower = latest['BB_lower'] if 'BB_lower' in valid.columns and pd.notna(latest.get('BB_lower')) else latest['Close']
         
         # Volume analysis
-        avg_volume = data['Volume'].rolling(20).mean().iloc[-1]
-        volume_ratio = latest['Volume'] / avg_volume if avg_volume > 0 else 1
+        avg_volume = data['Volume'].rolling(20, min_periods=20).mean().iloc[-1]
+        volume_ratio = latest['Volume'] / avg_volume if pd.notna(avg_volume) and avg_volume > 0 else 1
         
         # MACD analysis
-        macd = latest.get('MACD', 0)
-        macd_signal = latest.get('MACD_signal', 0)
+        macd = latest['MACD'] if 'MACD' in valid.columns and pd.notna(latest.get('MACD')) else 0
+        macd_signal = latest['MACD_signal'] if 'MACD_signal' in valid.columns and pd.notna(latest.get('MACD_signal')) else 0
         
         # Generate analysis
         analysis = []
@@ -280,7 +225,7 @@ class StockAnalyzer:
             analysis.append("📊 Normal volume levels")
         
         # Market cap context
-        market_cap = info.get('marketCap', 0)
+        market_cap = info.get('marketCap', 0) or 0
         if market_cap:
             if market_cap > 200e9:  # > 200B
                 analysis.append("🏢 Large-cap stability with lower volatility expected")
@@ -421,16 +366,18 @@ def create_advanced_chart(data, symbol):
 
 def create_performance_metrics(data, symbol):
     """Create performance metrics visualization"""
-    # Calculate returns
-    data['Daily_Returns'] = data['Close'].pct_change()
-    data['Cumulative_Returns'] = (1 + data['Daily_Returns']).cumprod() - 1
+    # Calculate returns on a sorted copy (never mutate the chart frame)
+    df = data.sort_index().copy()
+    df['Daily_Returns'] = df['Close'].pct_change()
+    df['Cumulative_Returns'] = (1 + df['Daily_Returns']).cumprod() - 1
     
     # Performance metrics
-    total_return = data['Cumulative_Returns'].iloc[-1] * 100
-    volatility = data['Daily_Returns'].std() * np.sqrt(252) * 100  # Annualized
-    sharpe_ratio = (data['Daily_Returns'].mean() * 252) / (data['Daily_Returns'].std() * np.sqrt(252))
+    daily = df['Daily_Returns'].dropna()
+    total_return = df['Cumulative_Returns'].iloc[-1] * 100
+    volatility = daily.std() * np.sqrt(252) * 100  # Annualized
+    sharpe_ratio = (daily.mean() * 252) / (daily.std() * np.sqrt(252)) if daily.std() > 0 else 0.0
     
-    max_drawdown = ((data['Close'] / data['Close'].expanding().max()) - 1).min() * 100
+    max_drawdown = ((df['Close'] / df['Close'].expanding().max()) - 1).min() * 100
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -447,8 +394,8 @@ def create_performance_metrics(data, symbol):
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=data.index,
-            y=data['Cumulative_Returns'] * 100,
+            x=df.index,
+            y=df['Cumulative_Returns'] * 100,
             mode='lines',
             name='Cumulative Returns',
             line=dict(color='#00ff88', width=2)
@@ -463,6 +410,36 @@ def create_performance_metrics(data, symbol):
         height=400
     )
     
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def create_backtest_chart(backtest, symbol):
+    """Plot strategy vs buy-and-hold equity from the aligned backtest."""
+    if backtest is None or backtest.empty:
+        st.info("Not enough aligned bars to run the backtest.")
+        return
+
+    total_ret = (backtest['equity'].iloc[-1] - 1) * 100
+    bench_ret = (backtest['benchmark'].iloc[-1] - 1) * 100
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Strategy Return", f"{total_ret:.2f}%")
+    c2.metric("Buy & Hold Return", f"{bench_ret:.2f}%")
+    c3.metric("Bars Traded", f"{int((backtest['position'] != 0).sum())} / {len(backtest)}")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=backtest.index, y=backtest['equity'], mode='lines',
+        name='ML Strategy', line=dict(color='#00ff88', width=2)
+    ))
+    fig.add_trace(go.Scatter(
+        x=backtest.index, y=backtest['benchmark'], mode='lines',
+        name='Buy & Hold', line=dict(color='#007aff', width=2, dash='dash')
+    ))
+    fig.update_layout(
+        title=f'{symbol} Backtest - Equity Curve (strictly aligned, no look-ahead)',
+        xaxis_title='Date', yaxis_title='Growth of $1',
+        template='plotly_dark', height=380
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 # Streamlit App
@@ -492,43 +469,73 @@ def main():
     else:
         symbol = popular_stocks[stock_choice]
     
-    # Time period
-    period = st.sidebar.selectbox(
-        "📅 Analysis Period:",
-        options=['1mo', '3mo', '6mo', '1y', '2y', '5y'],
+    # Explicit date range (both ends are part of the cache key)
+    st.sidebar.subheader("📅 Date Range")
+    range_preset = st.sidebar.selectbox(
+        "Quick range:",
+        options=['Custom', '1mo', '3mo', '6mo', '1y', '2y', '5y'],
+        index=4
+    )
+    today = datetime.now().date()
+    preset_days = {'1mo': 30, '3mo': 91, '6mo': 182, '1y': 365, '2y': 730, '5y': 1825}
+    default_start = today - timedelta(days=preset_days.get(range_preset, 365))
+    start_date = st.sidebar.date_input("Start date:", value=default_start)
+    end_date = st.sidebar.date_input("End date:", value=today)
+    if start_date >= end_date:
+        st.sidebar.error("Start date must be earlier than end date.")
+
+    # Adjustment mode - the third element of the cache key
+    adjust = st.sidebar.selectbox(
+        "💱 Adjustment:",
+        options=list(ADJUST_LABELS.keys()),
+        format_func=lambda k: ADJUST_LABELS[k],
         index=3
     )
-    
+
     st.sidebar.markdown("---")
-    
+
     # Analysis options
     st.sidebar.subheader("🔧 Analysis Options")
     show_prediction = st.sidebar.checkbox("🔮 ML Price Prediction", value=True)
     show_technical = st.sidebar.checkbox("📈 Technical Charts", value=True)
     show_performance = st.sidebar.checkbox("📊 Performance Metrics", value=True)
     show_analysis = st.sidebar.checkbox("🧠 AI Market Analysis", value=True)
-    
+
     st.sidebar.markdown("---")
-    
+
     if st.sidebar.button("🔄 Refresh Data", type="primary"):
-        st.cache_data.clear()
+        data_fetcher.clear(symbol)
         st.rerun()
-    
+
     # Initialize analyzer
     analyzer = StockAnalyzer()
-    
-    # Fetch and display data
+
+    # Fetch through the layered LRU (key = ticker + start + end + adjust)
     with st.spinner(f"📡 Fetching live data for {symbol}..."):
-        data, info = analyzer.fetch_stock_data(symbol, period)
-    
-    if data is None or data.empty:
-        st.error(f"❌ Could not fetch data for {symbol}. Please verify the symbol and try again.")
+        fetch_result = analyzer.fetch_stock_data(symbol, start_date, end_date, adjust)
+
+    if not fetch_result.ok:
+        st.error(f"❌ Could not fetch data for {symbol} after {fetch_result.attempts} attempts.")
+        if fetch_result.error:
+            st.caption(f"Last error: {fetch_result.error}")
         st.info("💡 Try popular symbols like AAPL, MSFT, GOOGL, TSLA, etc.")
         return
-    
-    # Calculate technical indicators
+
+    raw_data, info = fetch_result.data, fetch_result.info
+
+    # Indicator layer: sort by date, NaN where windows are insufficient
     with st.spinner("⚙️ Calculating technical indicators..."):
-        data = analyzer.calculate_technical_indicators(data)
+        data = analyzer.calculate_technical_indicators(raw_data)
+
+    # Data freshness banner (stale-snapshot degradation shows at the top)
+    freshness = fetch_result.freshness_text()
+    if freshness:
+        if fetch_result.stale:
+            st.warning(freshness)
+        elif fetch_result.cached:
+            st.caption(freshness)
+        else:
+            st.success(freshness)
     
     # Main dashboard header
     st.markdown("---")
@@ -550,13 +557,13 @@ def main():
     
     with col2:
         volume = data['Volume'].iloc[-1]
-        avg_volume = data['Volume'].rolling(20).mean().iloc[-1]
-        volume_change = ((volume - avg_volume) / avg_volume) * 100 if avg_volume > 0 else 0
-        st.metric(
-            label="📊 Volume",
-            value=f"{volume:,.0f}",
-            delta=f"{volume_change:+.1f}% vs 20d avg"
-        )
+        avg_volume = data['Volume'].rolling(20, min_periods=20).mean().iloc[-1]
+        if pd.notna(avg_volume) and avg_volume > 0:
+            volume_change = ((volume - avg_volume) / avg_volume) * 100
+            volume_delta = f"{volume_change:+.1f}% vs 20d avg"
+        else:
+            volume_delta = "N/A vs 20d avg"
+        st.metric(label="📊 Volume", value=f"{volume:,.0f}", delta=volume_delta)
     
     with col3:
         if 'RSI' in data.columns and not pd.isna(data['RSI'].iloc[-1]):
@@ -583,7 +590,7 @@ def main():
             st.metric(label="📈 vs SMA 20", value="N/A")
     
     with col5:
-        market_cap = info.get('marketCap', 0)
+        market_cap = info.get('marketCap', 0) or 0
         if market_cap:
             if market_cap > 1e12:
                 cap_display = f"${market_cap/1e12:.2f}T"
@@ -666,6 +673,13 @@ def main():
                 )
                 fig_importance.update_layout(height=400)
                 st.plotly_chart(fig_importance, use_container_width=True)
+
+        # Backtest uses the identical forward shift as the training label;
+        # the series is strictly dropna'd (last bar excluded).
+        if model_info:
+            with st.spinner("📊 Running look-ahead-free backtest..."):
+                backtest = analyzer.run_model_backtest(data, model_info)
+            create_backtest_chart(backtest, symbol)
     
     # AI Market Analysis
     if show_analysis:
